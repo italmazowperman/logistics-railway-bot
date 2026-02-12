@@ -4,20 +4,20 @@ const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const TelegramBot = require('node-telegram-bot-api');
 
-// --- Настройки ---
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY; // тот же ключ, что и в WPF
-const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL; // строка подключения к Supabase (PostgreSQL)
+const API_KEY = process.env.API_KEY;
+const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // ID пользователя/группы для уведомлений
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 
-// --- Подключение к Supabase ---
+// --- Подключение к Supabase (с принудительным IPv4 через пулер) ---
 const pool = new Pool({
   connectionString: SUPABASE_DB_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10000,
 });
 
 // --- Telegram Bot ---
@@ -27,7 +27,7 @@ if (TELEGRAM_TOKEN) {
   console.log('Telegram bot started');
 }
 
-// --- Middleware: проверка API ключа ---
+// --- Проверка API ключа ---
 const requireApiKey = (req, res, next) => {
   const key = req.headers['x-api-key'];
   if (key && key === API_KEY) {
@@ -41,83 +41,24 @@ const requireApiKey = (req, res, next) => {
 async function initDatabase() {
   const client = await pool.connect();
   try {
-    // Таблица orders
+    // Таблица для заказов (JSONB)
     await client.query(`
-      CREATE TABLE IF NOT EXISTS orders (
+      CREATE TABLE IF NOT EXISTS orders_sync (
         id INT PRIMARY KEY,
-        ordernumber VARCHAR(50) NOT NULL,
-        clientname VARCHAR(200) NOT NULL,
-        containercount INT,
-        goodstype VARCHAR(100),
-        route VARCHAR(200),
-        transitport VARCHAR(100),
-        documentnumber VARCHAR(100),
-        chinesetransportcompany VARCHAR(200),
-        iraniantransportcompany VARCHAR(200),
-        status VARCHAR(50),
-        statuscolor VARCHAR(20),
-        creationdate TIMESTAMP,
-        loadingdate TIMESTAMP,
-        departuredate TIMESTAMP,
-        arrivalirandate TIMESTAMP,
-        truckloadingdate TIMESTAMP,
-        arrivalturkmenistandate TIMESTAMP,
-        clientreceivingdate TIMESTAMP,
-        arrivalnoticedate TIMESTAMP,
-        tkmdate TIMESTAMP,
-        etadate TIMESTAMP,
-        hasloadingphoto BOOLEAN,
-        haslocalcharges BOOLEAN,
-        hastex BOOLEAN,
-        notes TEXT,
-        additionalinfo TEXT,
+        data JSONB NOT NULL,
         lastmodified TIMESTAMP NOT NULL,
         isdeleted BOOLEAN DEFAULT FALSE
       )
     `);
-    
-    // Таблица containers
+    // Таблица для задач
     await client.query(`
-      CREATE TABLE IF NOT EXISTS containers (
-        id INT PRIMARY KEY,
-        orderid INT NOT NULL,
-        containernumber VARCHAR(50),
-        containertype VARCHAR(50),
-        weight DECIMAL,
-        volume DECIMAL,
-        loadingdate TIMESTAMP,
-        departuredate TIMESTAMP,
-        arrivalirandate TIMESTAMP,
-        truckloadingdate TIMESTAMP,
-        arrivalturkmenistandate TIMESTAMP,
-        clientreceivingdate TIMESTAMP,
-        driverfirstname VARCHAR(100),
-        driverlastname VARCHAR(100),
-        drivercompany VARCHAR(200),
-        trucknumber VARCHAR(50),
-        driveriranphone VARCHAR(50),
-        driverturkmenistanphone VARCHAR(50),
-        lastmodified TIMESTAMP NOT NULL,
-        isdeleted BOOLEAN DEFAULT FALSE
-      )
-    `);
-    
-    // Таблица tasks
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS tasks (
+      CREATE TABLE IF NOT EXISTS tasks_sync (
         taskid INT PRIMARY KEY,
-        orderid INT NOT NULL,
-        description VARCHAR(500) NOT NULL,
-        assignedto VARCHAR(100),
-        status INT,
-        priority INT,
-        duedate TIMESTAMP,
-        createddate TIMESTAMP,
+        data JSONB NOT NULL,
         lastmodified TIMESTAMP NOT NULL,
         isdeleted BOOLEAN DEFAULT FALSE
       )
     `);
-    
     console.log('Tables ensured in Supabase');
   } catch (err) {
     console.error('Error creating tables:', err);
@@ -127,79 +68,38 @@ async function initDatabase() {
 }
 initDatabase();
 
-// --- API эндпоинты для синхронизации ---
-
-// Обновление заказа
+// --- Эндпоинт: приём заказа ---
 app.post('/api/sync/order', requireApiKey, async (req, res) => {
   const order = req.body;
   const client = await pool.connect();
   try {
-    // UPSERT: вставляем или обновляем
     const query = `
-      INSERT INTO orders (
-        id, ordernumber, clientname, containercount, goodstype, route, transitport,
-        documentnumber, chinesetransportcompany, iraniantransportcompany,
-        status, statuscolor, creationdate, loadingdate, departuredate,
-        arrivalirandate, truckloadingdate, arrivalturkmenistandate,
-        clientreceivingdate, arrivalnoticedate, tkmdate, etadate,
-        hasloadingphoto, haslocalcharges, hastex, notes, additionalinfo,
-        lastmodified, isdeleted
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+      INSERT INTO orders_sync (id, data, lastmodified, isdeleted)
+      VALUES ($1, $2, $3, $4)
       ON CONFLICT (id) DO UPDATE SET
-        ordernumber = EXCLUDED.ordernumber,
-        clientname = EXCLUDED.clientname,
-        containercount = EXCLUDED.containercount,
-        goodstype = EXCLUDED.goodstype,
-        route = EXCLUDED.route,
-        transitport = EXCLUDED.transitport,
-        documentnumber = EXCLUDED.documentnumber,
-        chinesetransportcompany = EXCLUDED.chinesetransportcompany,
-        iraniantransportcompany = EXCLUDED.iraniantransportcompany,
-        status = EXCLUDED.status,
-        statuscolor = EXCLUDED.statuscolor,
-        creationdate = EXCLUDED.creationdate,
-        loadingdate = EXCLUDED.loadingdate,
-        departuredate = EXCLUDED.departuredate,
-        arrivalirandate = EXCLUDED.arrivalirandate,
-        truckloadingdate = EXCLUDED.truckloadingdate,
-        arrivalturkmenistandate = EXCLUDED.arrivalturkmenistandate,
-        clientreceivingdate = EXCLUDED.clientreceivingdate,
-        arrivalnoticedate = EXCLUDED.arrivalnoticedate,
-        tkmdate = EXCLUDED.tkmdate,
-        etadate = EXCLUDED.etadate,
-        hasloadingphoto = EXCLUDED.hasloadingphoto,
-        haslocalcharges = EXCLUDED.haslocalcharges,
-        hastex = EXCLUDED.hastex,
-        notes = EXCLUDED.notes,
-        additionalinfo = EXCLUDED.additionalinfo,
+        data = EXCLUDED.data,
         lastmodified = EXCLUDED.lastmodified,
         isdeleted = EXCLUDED.isdeleted
     `;
-    const values = [
-      order.id, order.orderNumber, order.clientName, order.containerCount,
-      order.goodsType, order.route, order.transitPort, order.documentNumber,
-      order.chineseTransportCompany, order.iranianTransportCompany,
-      order.status, order.statusColor, order.creationDate,
-      order.loadingDate, order.departureDate, order.arrivalIranDate,
-      order.truckLoadingDate, order.arrivalTurkmenistanDate,
-      order.clientReceivingDate, order.arrivalNoticeDate, order.tkmDate, order.etaDate,
-      order.hasLoadingPhoto, order.hasLocalCharges, order.hasTex,
-      order.notes, order.additionalInfo,
-      order.lastModified, order.isDeleted || false
-    ];
-    await client.query(query, values);
-    
-    // Отправляем уведомление в Telegram
+    await client.query(query, [
+      order.id,
+      JSON.stringify(order),
+      order.lastModified || new Date(),
+      order.isDeleted || false
+    ]);
+
+    // Уведомление в Telegram
     if (bot && TELEGRAM_CHAT_ID) {
-      let msg = `🔄 *Order Updated*\n`;
-      msg += `*Number:* ${order.orderNumber}\n`;
-      msg += `*Client:* ${order.clientName}\n`;
-      msg += `*Status:* ${order.status}\n`;
-      msg += `*Modified:* ${new Date(order.lastModified).toLocaleString()}`;
+      let msg = `🔄 *Заказ обновлён*\n`;
+      msg += `*№:* ${order.orderNumber}\n`;
+      msg += `*Клиент:* ${order.clientName}\n`;
+      msg += `*Статус:* ${order.status}\n`;
+      msg += `*Контейнеров:* ${order.containerCount}\n`;
+      msg += `*TKM:* ${order.tkmDate ? new Date(order.tkmDate).toLocaleDateString('ru-RU') : '—'}`;
       bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown' });
     }
-    
-    res.status(200).json({ success: true });
+
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -208,39 +108,54 @@ app.post('/api/sync/order', requireApiKey, async (req, res) => {
   }
 });
 
-// Обновление задачи – аналогично
+// --- Эндпоинт: приём задачи ---
 app.post('/api/sync/task', requireApiKey, async (req, res) => {
-  // ... аналогично, создайте таблицу tasks и upsert
-});
-
-// Эндпоинт для получения отчётов (используется ботом)
-app.get('/api/report', async (req, res) => {
+  const task = req.body;
   const client = await pool.connect();
   try {
-    const result = await client.query(`
-      SELECT * FROM orders 
-      WHERE isdeleted = false 
-      ORDER BY lastmodified DESC LIMIT 100
-    `);
-    res.json(result.rows);
+    const query = `
+      INSERT INTO tasks_sync (taskid, data, lastmodified, isdeleted)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (taskid) DO UPDATE SET
+        data = EXCLUDED.data,
+        lastmodified = EXCLUDED.lastmodified,
+        isdeleted = EXCLUDED.isdeleted
+    `;
+    await client.query(query, [
+      task.taskId,
+      JSON.stringify(task),
+      task.lastModified || new Date(),
+      task.isDeleted || false
+    ]);
+
+    if (bot && TELEGRAM_CHAT_ID) {
+      let msg = `📋 *Задача обновлена*\n`;
+      msg += `*Описание:* ${task.description}\n`;
+      msg += `*Исполнитель:* ${task.assignedTo || '—'}\n`;
+      msg += `*Статус:* ${['ToDo','InProgress','Completed'][task.status]}\n`;
+      msg += `*Срок:* ${task.dueDate ? new Date(task.dueDate).toLocaleDateString('ru-RU') : '—'}`;
+      bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown' });
+    }
+
+    res.json({ success: true });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
 });
 
-// --- Telegram Bot команды ---
+// --- Telegram команды ---
 if (bot) {
   bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 
       '👋 *LogisticsManager Bot*\n\n'
       + 'Доступные команды:\n'
-      + '/status - общая статистика\n'
-      + '/recent - последние 5 изменений\n'
-      + '/order [номер] - информация о заказе\n'
-      + '/orders - список активных заказов\n'
-      + '/tasks - просроченные задачи',
+      + '/status — общая статистика\n'
+      + '/recent — последние 5 заказов\n'
+      + '/order [номер] — информация о заказе\n'
+      + '/help — помощь',
       { parse_mode: 'Markdown' }
     );
   });
@@ -249,15 +164,27 @@ if (bot) {
     const chatId = msg.chat.id;
     const client = await pool.connect();
     try {
-      const totalOrders = await client.query('SELECT COUNT(*) FROM orders WHERE isdeleted = false');
-      const activeOrders = await client.query("SELECT COUNT(*) FROM orders WHERE status NOT IN ('Completed','Cancelled') AND isdeleted = false");
-      const totalContainers = await client.query('SELECT SUM(containercount) FROM orders WHERE isdeleted = false');
-      const response = 
+      const total = await client.query('SELECT COUNT(*) FROM orders_sync WHERE isdeleted = false');
+      const orders = await client.query(`
+        SELECT data FROM orders_sync 
+        WHERE isdeleted = false 
+        ORDER BY lastmodified DESC 
+        LIMIT 100
+      `);
+      
+      let active = 0, containers = 0;
+      orders.rows.forEach(row => {
+        const o = row.data;
+        if (o.status !== 'Completed' && o.status !== 'Cancelled') active++;
+        containers += o.containerCount || 0;
+      });
+
+      const resp = 
         `📊 *Общая статистика*\n\n`
-        + `Всего заказов: ${totalOrders.rows[0].count}\n`
-        + `Активных заказов: ${activeOrders.rows[0].count}\n`
-        + `Контейнеров: ${totalContainers.rows[0].sum || 0}`;
-      bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+        + `Всего заказов: ${total.rows[0].count}\n`
+        + `Активных: ${active}\n`
+        + `Контейнеров: ${containers}`;
+      bot.sendMessage(chatId, resp, { parse_mode: 'Markdown' });
     } catch (err) {
       bot.sendMessage(chatId, 'Ошибка при получении статистики');
     } finally {
@@ -265,7 +192,66 @@ if (bot) {
     }
   });
 
-  // ... добавьте другие команды по необходимости
+  bot.onText(/\/recent/, async (msg) => {
+    const chatId = msg.chat.id;
+    const client = await pool.connect();
+    try {
+      const res = await client.query(`
+        SELECT data FROM orders_sync 
+        WHERE isdeleted = false 
+        ORDER BY lastmodified DESC 
+        LIMIT 5
+      `);
+      if (res.rows.length === 0) {
+        bot.sendMessage(chatId, 'Нет заказов');
+        return;
+      }
+      let text = '🕒 *Последние 5 заказов:*\n\n';
+      res.rows.forEach((row, i) => {
+        const o = row.data;
+        text += `${i+1}. *${o.orderNumber}* — ${o.clientName}\n`;
+        text += `   Статус: ${o.status}\n`;
+        text += `   Изменён: ${new Date(o.lastModified).toLocaleString('ru-RU')}\n\n`;
+      });
+      bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+    } catch (err) {
+      bot.sendMessage(chatId, 'Ошибка');
+    } finally {
+      client.release();
+    }
+  });
+
+  bot.onText(/\/order (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const orderNumber = match[1].trim();
+    const client = await pool.connect();
+    try {
+      const res = await client.query(`
+        SELECT data FROM orders_sync 
+        WHERE data->>'orderNumber' = $1 AND isdeleted = false
+        ORDER BY lastmodified DESC LIMIT 1
+      `, [orderNumber]);
+      if (res.rows.length === 0) {
+        bot.sendMessage(chatId, `Заказ ${orderNumber} не найден`);
+        return;
+      }
+      const o = res.rows[0].data;
+      let msgText = `📦 *Заказ ${o.orderNumber}*\n\n`;
+      msgText += `*Клиент:* ${o.clientName}\n`;
+      msgText += `*Груз:* ${o.goodsType || '—'}\n`;
+      msgText += `*Маршрут:* ${o.route || '—'}\n`;
+      msgText += `*Контейнеров:* ${o.containerCount || 0}\n`;
+      msgText += `*Вес:* ${o.totalWeight || 0} кг\n`;
+      msgText += `*Статус:* ${o.status}\n`;
+      msgText += `*TKM:* ${o.tkmDate ? new Date(o.tkmDate).toLocaleDateString('ru-RU') : '—'}\n`;
+      msgText += `*Последнее изменение:* ${new Date(o.lastModified).toLocaleString('ru-RU')}`;
+      bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+    } catch (err) {
+      bot.sendMessage(chatId, 'Ошибка');
+    } finally {
+      client.release();
+    }
+  });
 }
 
 app.listen(PORT, () => {
